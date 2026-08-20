@@ -67,6 +67,34 @@ var _ = ginkgo.Describe("cloud-ingress-operator", ginkgo.Ordered, func() {
 		if sts {
 			ginkgo.Skip("CIO is not deployed on STS clusters")
 		}
+
+		// On CI lease clusters, the rh-api APIScheme CR may not exist because
+		// it's normally created by a SelectorSyncSet on production managed
+		// clusters. Seed a minimal rh-api CR so the CIDR block test has
+		// something to reconcile against.
+		var existing cloudingressv1alpha1.APIScheme
+		if getErr := k8s.Get(ctx, apiSchemeResourceName, config.OperatorNamespace, &existing); apierrors.IsNotFound(getErr) {
+			ginkgo.GinkgoLogr.Info("rh-api APIScheme not found, seeding test fixture")
+			seedCR := &cloudingressv1alpha1.APIScheme{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "APIScheme",
+					APIVersion: cloudingressv1alpha1.GroupVersion.String(),
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      apiSchemeResourceName,
+					Namespace: config.OperatorNamespace,
+				},
+				Spec: cloudingressv1alpha1.APISchemeSpec{
+					ManagementAPIServerIngress: cloudingressv1alpha1.ManagementAPIServerIngress{
+						Enabled:           true,
+						DNSName:           "rh-api",
+						AllowedCIDRBlocks: []string{"0.0.0.0/0"},
+					},
+				},
+			}
+			err = k8s.Create(ctx, seedCR)
+			Expect(err).NotTo(HaveOccurred(), "Failed to seed rh-api APIScheme fixture")
+		}
 	})
 
 	ginkgo.It("is installed", func(ctx context.Context) {
@@ -85,8 +113,14 @@ var _ = ginkgo.Describe("cloud-ingress-operator", ginkgo.Ordered, func() {
 	})
 
 	ginkgo.It("reconciles cidr block changes in apischeme with rh-api service", func(ctx context.Context) {
-		err := k8s.Get(ctx, apiSchemeResourceName, config.OperatorNamespace, &apiScheme)
-		Expect(err).NotTo(HaveOccurred(), "Could not get apischeme CR instance")
+		ginkgo.By("Waiting for apischeme CR to be available")
+		err := wait.PollUntilContextTimeout(ctx, pollingInterval, pollingDuration, true, func(ctx context.Context) (bool, error) {
+			if err := k8s.Get(ctx, apiSchemeResourceName, config.OperatorNamespace, &apiScheme); err != nil {
+				return false, nil
+			}
+			return true, nil
+		})
+		Expect(err).NotTo(HaveOccurred(), "Could not get apischeme CR instance after polling")
 		originalCidrBlock := make([]string, len(apiScheme.Spec.ManagementAPIServerIngress.AllowedCIDRBlocks))
 		copy(originalCidrBlock, apiScheme.Spec.ManagementAPIServerIngress.AllowedCIDRBlocks)
 		updatedApiScheme := apiScheme.DeepCopy()
